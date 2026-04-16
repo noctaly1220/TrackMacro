@@ -249,7 +249,7 @@ with tab1:
 
     # ── SUGGESTION COMPLÉTION CALORIES ───────────────────────────────────
     kcal_manquant = settings["objectif_kcal"] - totaux["kcal"]
-    if 50 < kcal_manquant < settings["objectif_kcal"]:
+    if 1000 >= kcal_manquant > 0:
         st.markdown(f'<div class="section-title">💡 Il te manque {round(kcal_manquant)} kcal</div>', unsafe_allow_html=True)
 
         sug_mode = st.radio("Suggestion basée sur :", ["Mes aliments", "Mes repas", "Claude AI 🤖"],
