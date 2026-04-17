@@ -128,8 +128,10 @@ def search_openfoodfacts(query):
 foods_db  = load_json(DB_FILE, DEFAULT_FOODS)
 if not os.path.exists(DB_FILE): save_json(DB_FILE, foods_db)
 daily_log = load_json(LOG_FILE, {})
-settings  = load_json(SETTINGS_FILE, {"objectif_kcal":2000,"objectif_prot":150,"objectif_gluc":250,"objectif_lip":65})
 meals_db  = load_json(MEALS_FILE, {})
+
+# Settings toujours rechargé depuis le fichier (fix bug calculateur)
+settings = load_json(SETTINGS_FILE, {"objectif_kcal":2000,"objectif_prot":150,"objectif_gluc":250,"objectif_lip":65})
 
 today = today_key()
 if today not in daily_log: daily_log[today] = []
@@ -171,6 +173,144 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["➕ Aliment", "🍽️ Repas", "📋 Ba
 # TAB 1 — ALIMENT
 # ═══════════════════════════════════════════════════
 with tab1:
+    # ── BOUTON REMPLIS TES CALORIES ──────────────────────────────────────────
+    kcal_manquant = settings["objectif_kcal"] - totaux["kcal"]
+    if kcal_manquant > 0:
+        col_fill, col_fill_info = st.columns([2, 3])
+        with col_fill:
+            if st.button(f"🍽️ Remplis tes calories", key="btn_fill_top"):
+                st.session_state["show_fill"] = True
+        with col_fill_info:
+            st.markdown(f"<div style='padding:10px 0;font-size:0.78rem;color:#666'>Il te manque <span style='color:#e8ff5a;font-family:Space Mono,monospace;font-weight:700'>{round(kcal_manquant)} kcal</span></div>", unsafe_allow_html=True)
+
+        if st.session_state.get("show_fill"):
+            st.markdown('<div class="section-title">💡 Suggestions pour compléter</div>', unsafe_allow_html=True)
+            sug_mode = st.radio("Basé sur :", ["Mes aliments", "Mes repas", "Claude AI 🤖"],
+                                horizontal=True, label_visibility="collapsed", key="sug_mode_top")
+            TOLERANCE = 0.30
+
+            if sug_mode == "Mes aliments":
+                suggestions = []
+                for fname, fdata in foods_db.items():
+                    kcal_100 = fdata["kcal"]
+                    if kcal_100 <= 0: continue
+                    grams_needed = round(kcal_manquant / kcal_100 * 100)
+                    if 20 <= grams_needed <= 600:
+                        actual_kcal = round(kcal_100 * grams_needed / 100)
+                        if abs(actual_kcal - kcal_manquant) / max(kcal_manquant,1) <= TOLERANCE:
+                            macros = calc_macros(fdata, grams_needed)
+                            suggestions.append({"nom":fname,"grammes":grams_needed,"kcal":actual_kcal,
+                                "proteines":macros["proteines"],"glucides":macros["glucides"],
+                                "lipides":macros["lipides"],"fibres":macros["fibres"]})
+                suggestions.sort(key=lambda x: abs(x["kcal"] - kcal_manquant))
+                if not suggestions:
+                    st.info("Aucun aliment de ta base ne correspond. Essaie Claude AI 🤖.")
+                for i, s in enumerate(suggestions[:5]):
+                    col_s, col_b = st.columns([4,1])
+                    with col_s:
+                        st.markdown(f"""
+                        <div class="food-item" style="flex-direction:column;align-items:flex-start">
+                            <span style="font-weight:600">{s['nom']} <span style="color:#444">({s['grammes']}g)</span></span>
+                            <span style="color:#555;font-size:0.72rem"><span style="color:#e8ff5a">{s['kcal']} kcal</span> · P {s['proteines']}g G {s['glucides']}g L {s['lipides']}g</span>
+                        </div>""", unsafe_allow_html=True)
+                    with col_b:
+                        if st.button("➕", key=f"fill_food_{i}"):
+                            daily_log[today].append(s)
+                            save_json(LOG_FILE, daily_log)
+                            st.session_state["show_fill"] = False
+                            st.rerun()
+
+            elif sug_mode == "Mes repas":
+                suggestions_meals = []
+                for mname, mdata in meals_db.items():
+                    entries = [calc_macros(foods_db[i["food"]], i["grams"])
+                               for i in mdata["items"] if i["food"] in foods_db and i["grams"]>0]
+                    if not entries: continue
+                    pt = sum_macros(entries)
+                    if pt["kcal"] <= 0: continue
+                    scale = kcal_manquant / pt["kcal"]
+                    scaled_kcal = round(pt["kcal"] * scale)
+                    if abs(scaled_kcal - kcal_manquant) / max(kcal_manquant,1) <= TOLERANCE and 0.3 <= scale <= 2.0:
+                        suggestions_meals.append({"nom":mname,"scale":round(scale,2),"kcal":scaled_kcal,
+                            "proteines":round(pt["proteines"]*scale,1),"glucides":round(pt["glucides"]*scale,1),
+                            "lipides":round(pt["lipides"]*scale,1),"items":mdata["items"]})
+                suggestions_meals.sort(key=lambda x: abs(x["kcal"]-kcal_manquant))
+                if not suggestions_meals:
+                    st.info("Aucun repas enregistré ne correspond. Essaie Claude AI 🤖.")
+                for i, s in enumerate(suggestions_meals[:4]):
+                    scale_txt = f"×{s['scale']}" if s['scale'] != 1.0 else "quantité normale"
+                    col_s, col_b = st.columns([4,1])
+                    with col_s:
+                        st.markdown(f"""
+                        <div class="meal-card" style="margin:4px 0">
+                            <div class="meal-name">{s['nom']} <span style="color:#444;font-size:0.7rem">({scale_txt})</span></div>
+                            <div class="meal-meta"><span style="color:#e8ff5a">{s['kcal']} kcal</span> · P {s['proteines']}g G {s['glucides']}g L {s['lipides']}g</div>
+                        </div>""", unsafe_allow_html=True)
+                    with col_b:
+                        if st.button("➕", key=f"fill_meal_{i}"):
+                            for item in s["items"]:
+                                if item["food"] in foods_db:
+                                    g_scaled = max(1, round(item["grams"]*s["scale"]))
+                                    e = calc_macros(foods_db[item["food"]], g_scaled)
+                                    e.update({"nom":item["food"],"grammes":g_scaled,"repas":s["nom"]})
+                                    daily_log[today].append(e)
+                            save_json(LOG_FILE, daily_log)
+                            st.session_state["show_fill"] = False
+                            st.rerun()
+
+            else:  # Claude AI
+                prot_rest = max(0, round(settings["objectif_prot"] - totaux["proteines"]))
+                gluc_rest = max(0, round(settings["objectif_gluc"] - totaux["glucides"]))
+                lip_rest  = max(0, round(settings["objectif_lip"]  - totaux["lipides"]))
+                foods_list = ", ".join(list(foods_db.keys())[:20])
+                if st.button("✨ Générer une suggestion IA", key="btn_ai_fill"):
+                    with st.spinner("Claude réfléchit..."):
+                        try:
+                            import json as _json
+                            prompt = f"""Tu es un coach nutrition. L'utilisateur a mangé {round(totaux['kcal'])} kcal aujourd'hui et doit atteindre {settings['objectif_kcal']} kcal.
+Il lui manque {round(kcal_manquant)} kcal, {prot_rest}g protéines, {gluc_rest}g glucides, {lip_rest}g lipides.
+Ses aliments habituels : {foods_list}.
+Propose UNE suggestion concrète. Réponds UNIQUEMENT en JSON valide sans markdown :
+{{"suggestion":"nom","description":"max 15 mots","kcal":300,"proteines":20,"glucides":30,"lipides":8,"portions":"ex: 150g X + 100g Y"}}"""
+                            resp = requests.post("https://api.anthropic.com/v1/messages",
+                                headers={"Content-Type":"application/json"},
+                                json={"model":"claude-sonnet-4-20250514","max_tokens":300,
+                                      "messages":[{"role":"user","content":prompt}]}, timeout=15)
+                            raw = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
+                            st.session_state["ai_suggestion"] = _json.loads(raw)
+                        except Exception as e:
+                            st.error(f"Erreur : {e}")
+
+                if "ai_suggestion" in st.session_state:
+                    s = st.session_state["ai_suggestion"]
+                    st.markdown(f"""
+                    <div style="background:#141414;border:1px solid #2a2a2a;border-radius:12px;padding:16px;margin:8px 0">
+                        <div style="font-family:Space Mono,monospace;font-size:1rem;color:#e8ff5a;font-weight:700;margin-bottom:4px">✨ {s.get('suggestion','?')}</div>
+                        <div style="font-size:0.78rem;color:#888;margin-bottom:6px">{s.get('description','')}</div>
+                        <div style="font-size:0.72rem;color:#666;margin-bottom:10px">📦 {s.get('portions','')}</div>
+                        <div style="display:flex;gap:12px;font-size:0.75rem">
+                            <span style="color:#e8ff5a">🔥 {s.get('kcal','?')} kcal</span>
+                            <span>💪 P {s.get('proteines','?')}g</span>
+                            <span>⚡ G {s.get('glucides','?')}g</span>
+                            <span>🥑 L {s.get('lipides','?')}g</span>
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+                    if st.button("➕ Ajouter au journal", key="btn_add_ai"):
+                        entry = {"nom":s.get("suggestion","Suggestion IA"),"grammes":0,
+                                 "kcal":float(s.get("kcal",0)),"proteines":float(s.get("proteines",0)),
+                                 "glucides":float(s.get("glucides",0)),"lipides":float(s.get("lipides",0)),"fibres":0.0}
+                        daily_log[today].append(entry)
+                        save_json(LOG_FILE, daily_log)
+                        del st.session_state["ai_suggestion"]
+                        st.session_state["show_fill"] = False
+                        st.rerun()
+
+            if st.button("✕ Fermer", key="btn_close_fill"):
+                st.session_state["show_fill"] = False
+                st.rerun()
+
+        st.markdown("---")
+
     st.markdown('<div class="section-title">Ajouter un aliment</div>', unsafe_allow_html=True)
     food_names = sorted(foods_db.keys())
     selected = st.selectbox("Aliment", food_names, label_visibility="collapsed", key="sel_food")
@@ -246,194 +386,6 @@ with tab1:
         daily_log[today] = []
         save_json(LOG_FILE, daily_log)
         st.rerun()
-
-    # ── SUGGESTION COMPLÉTION CALORIES ───────────────────────────────────
-    kcal_manquant = settings["objectif_kcal"] - totaux["kcal"]
-    if 1000 >= kcal_manquant > 0:
-        st.markdown(f'<div class="section-title">💡 Il te manque {round(kcal_manquant)} kcal</div>', unsafe_allow_html=True)
-
-        sug_mode = st.radio("Suggestion basée sur :", ["Mes aliments", "Mes repas", "Claude AI 🤖"],
-                            horizontal=True, label_visibility="collapsed", key="sug_mode")
-
-        TOLERANCE = 0.25  # ±25% de la cible
-
-        if sug_mode == "Mes aliments":
-            # Trouve les aliments dont une portion raisonnable (50–500g) approche la cible
-            suggestions = []
-            for fname, fdata in foods_db.items():
-                kcal_100 = fdata["kcal"]
-                if kcal_100 <= 0: continue
-                grams_needed = round(kcal_manquant / kcal_100 * 100)
-                if 20 <= grams_needed <= 600:
-                    actual_kcal = round(kcal_100 * grams_needed / 100)
-                    if abs(actual_kcal - kcal_manquant) / kcal_manquant <= TOLERANCE:
-                        macros = calc_macros(fdata, grams_needed)
-                        suggestions.append({
-                            "nom": fname, "grammes": grams_needed,
-                            "kcal": actual_kcal,
-                            "proteines": macros["proteines"],
-                            "glucides": macros["glucides"],
-                            "lipides": macros["lipides"],
-                        })
-            suggestions.sort(key=lambda x: abs(x["kcal"] - kcal_manquant))
-            suggestions = suggestions[:5]
-
-            if not suggestions:
-                st.info("Aucun aliment de ta base ne correspond à cette quantité. Essaie 'Claude AI 🤖'.")
-            else:
-                for i, s in enumerate(suggestions):
-                    col_s, col_b = st.columns([4, 1])
-                    with col_s:
-                        st.markdown(f"""
-                        <div class="food-item" style="flex-direction:column;align-items:flex-start">
-                            <span style="font-weight:600">{s['nom']} <span style="color:#444">({s['grammes']}g)</span></span>
-                            <span style="color:#555;font-size:0.72rem">
-                                <span style="color:#e8ff5a">{s['kcal']} kcal</span>
-                                &nbsp;·&nbsp; P {s['proteines']}g G {s['glucides']}g L {s['lipides']}g
-                            </span>
-                        </div>""", unsafe_allow_html=True)
-                    with col_b:
-                        if st.button("➕", key=f"sug_food_{i}"):
-                            entry = {k: v for k, v in s.items()}
-                            entry["nom"] = s["nom"]
-                            entry["grammes"] = s["grammes"]
-                            entry["fibres"] = round(foods_db[s["nom"]].get("fibres", 0) * s["grammes"] / 100, 1)
-                            daily_log[today].append(entry)
-                            save_json(LOG_FILE, daily_log)
-                            st.rerun()
-
-        elif sug_mode == "Mes repas":
-            suggestions_meals = []
-            for mname, mdata in meals_db.items():
-                entries = []
-                for item in mdata["items"]:
-                    if item["food"] in foods_db and item["grams"] > 0:
-                        entries.append(calc_macros(foods_db[item["food"]], item["grams"]))
-                if not entries: continue
-                pt = sum_macros(entries)
-                if pt["kcal"] <= 0: continue
-                # Propose aussi une version réduite/augmentée proportionnellement
-                scale = kcal_manquant / pt["kcal"]
-                scaled_kcal = round(pt["kcal"] * scale)
-                if abs(scaled_kcal - kcal_manquant) / kcal_manquant <= TOLERANCE and 0.3 <= scale <= 2.0:
-                    suggestions_meals.append({
-                        "nom": mname, "scale": round(scale, 2),
-                        "kcal": scaled_kcal,
-                        "proteines": round(pt["proteines"] * scale, 1),
-                        "glucides": round(pt["glucides"] * scale, 1),
-                        "lipides": round(pt["lipides"] * scale, 1),
-                        "items": mdata["items"],
-                    })
-            suggestions_meals.sort(key=lambda x: abs(x["kcal"] - kcal_manquant))
-
-            if not suggestions_meals:
-                st.info("Aucun repas enregistré ne correspond. Essaie 'Claude AI 🤖'.")
-            else:
-                for i, s in enumerate(suggestions_meals[:4]):
-                    scale_txt = f"×{s['scale']}" if s['scale'] != 1.0 else "quantité normale"
-                    col_s, col_b = st.columns([4, 1])
-                    with col_s:
-                        st.markdown(f"""
-                        <div class="meal-card" style="margin:4px 0">
-                            <div class="meal-name">{s['nom']} <span style="color:#444;font-size:0.7rem">({scale_txt})</span></div>
-                            <div class="meal-meta">
-                                <span style="color:#e8ff5a">{s['kcal']} kcal</span>
-                                &nbsp;·&nbsp; P {s['proteines']}g G {s['glucides']}g L {s['lipides']}g
-                            </div>
-                        </div>""", unsafe_allow_html=True)
-                    with col_b:
-                        if st.button("➕", key=f"sug_meal_{i}"):
-                            for item in s["items"]:
-                                if item["food"] in foods_db:
-                                    g_scaled = max(1, round(item["grams"] * s["scale"]))
-                                    e = calc_macros(foods_db[item["food"]], g_scaled)
-                                    e.update({"nom": item["food"], "grammes": g_scaled, "repas": s["nom"]})
-                                    daily_log[today].append(e)
-                            save_json(LOG_FILE, daily_log)
-                            st.rerun()
-
-        else:  # Claude AI
-            st.markdown(f"""
-            <div style="background:#0d0d0d;border:1px solid #1e1e1e;border-radius:10px;padding:12px;
-                        font-size:0.8rem;color:#666;margin-bottom:10px">
-                🤖 Claude va suggérer une idée de repas ou aliment pour combler
-                <strong style="color:#e8ff5a">~{round(kcal_manquant)} kcal</strong>
-                en tenant compte de tes objectifs (P {settings['objectif_prot']}g / G {settings['objectif_gluc']}g / L {settings['objectif_lip']}g).
-            </div>""", unsafe_allow_html=True)
-
-            # Contexte macros restants
-            prot_rest = max(0, round(settings["objectif_prot"] - totaux["proteines"]))
-            gluc_rest = max(0, round(settings["objectif_gluc"] - totaux["glucides"]))
-            lip_rest  = max(0, round(settings["objectif_lip"]  - totaux["lipides"]))
-
-            foods_list = ", ".join(list(foods_db.keys())[:20])
-
-            if st.button("✨ Générer une suggestion", key="btn_ai_suggest"):
-                with st.spinner("Claude réfléchit..."):
-                    try:
-                        import json as _json
-                        prompt = f"""Tu es un coach nutrition. L'utilisateur a mangé {round(totaux['kcal'])} kcal aujourd'hui et doit atteindre {settings['objectif_kcal']} kcal.
-Il lui manque environ {round(kcal_manquant)} kcal, {prot_rest}g de protéines, {gluc_rest}g de glucides, {lip_rest}g de lipides.
-Ses aliments habituels : {foods_list}.
-
-Propose UNE suggestion concrète (aliment simple ou petit repas) pour combler ce manque.
-Réponds UNIQUEMENT en JSON valide, sans markdown, sans explication :
-{{"suggestion": "nom du plat ou aliment", "description": "description courte max 15 mots", "kcal": 300, "proteines": 20, "glucides": 30, "lipides": 8, "portions": "ex: 150g de X + 100g de Y"}}"""
-
-                        resp = requests.post(
-                            "https://api.anthropic.com/v1/messages",
-                            headers={"Content-Type": "application/json"},
-                            json={
-                                "model": "claude-sonnet-4-20250514",
-                                "max_tokens": 300,
-                                "messages": [{"role": "user", "content": prompt}]
-                            },
-                            timeout=15
-                        )
-                        raw = resp.json()["content"][0]["text"].strip()
-                        raw = raw.replace("```json","").replace("```","").strip()
-                        data = _json.loads(raw)
-                        st.session_state["ai_suggestion"] = data
-                    except Exception as e:
-                        st.error(f"Erreur : {e}")
-
-            if "ai_suggestion" in st.session_state:
-                s = st.session_state["ai_suggestion"]
-                st.markdown(f"""
-                <div style="background:#141414;border:1px solid #2a2a2a;border-radius:12px;padding:16px;margin:8px 0">
-                    <div style="font-family:Space Mono,monospace;font-size:1rem;color:#e8ff5a;font-weight:700;margin-bottom:4px">
-                        ✨ {s.get('suggestion','?')}
-                    </div>
-                    <div style="font-size:0.78rem;color:#888;margin-bottom:10px">{s.get('description','')}</div>
-                    <div style="font-size:0.72rem;color:#666;margin-bottom:10px">📦 {s.get('portions','')}</div>
-                    <div style="display:flex;gap:12px;font-size:0.75rem">
-                        <span style="color:#e8ff5a">🔥 {s.get('kcal','?')} kcal</span>
-                        <span>💪 P {s.get('proteines','?')}g</span>
-                        <span>⚡ G {s.get('glucides','?')}g</span>
-                        <span>🥑 L {s.get('lipides','?')}g</span>
-                    </div>
-                </div>""", unsafe_allow_html=True)
-                if st.button("➕ Ajouter au journal", key="btn_add_ai_sug"):
-                    entry = {
-                        "nom": s.get("suggestion","Suggestion IA"),
-                        "grammes": 0,
-                        "kcal": float(s.get("kcal", 0)),
-                        "proteines": float(s.get("proteines", 0)),
-                        "glucides": float(s.get("glucides", 0)),
-                        "lipides": float(s.get("lipides", 0)),
-                        "fibres": 0.0,
-                    }
-                    daily_log[today].append(entry)
-                    save_json(LOG_FILE, daily_log)
-                    del st.session_state["ai_suggestion"]
-                    st.rerun()
-
-    elif totaux["kcal"] >= settings["objectif_kcal"] * 0.98:
-        st.markdown("""
-        <div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:10px;padding:12px;
-                    text-align:center;font-size:0.85rem;color:#4a8a4a;margin-top:12px">
-            ✅ Objectif calorique atteint !
-        </div>""", unsafe_allow_html=True)
 
 
 with tab2:
